@@ -1,29 +1,22 @@
 #!/usr/bin/env python3
 """
-NY‑UAS single‑document extractor  (PDF or DOCX)
------------------------------------------------
+NY‑UAS single‑document extractor  – PDF *or* DOCX (no NLTK)
+===========================================================
 
-• Accepts a Chrome‑saved PDF **or** the original .docx.
-• Pulls all configured labels into one spreadsheet:
-      Row 1 = headers  •  Row 2 = extracted values
-
-Usage
------
-python extractor.py path/to/note.pdf            # → output.xlsx
-python extractor.py note.pdf -o out.csv         # → CSV
+• Accepts Chrome‑saved PDFs or the original .docx
+• Uses a *tiny YAML override file* for tricky fields
+• Every other label falls back to:  label → "label with spaces:" → single‑line grab
+• Supports 'single_line', 'multi_line', and 'paragraph' rule types
 """
 
 import re, argparse, yaml, pandas as pd
 from pathlib import Path
-
-# -------------  PDF / DOCX readers  -------------
 import pdfplumber
 from docx import Document
-# -----------------------------------------------
 
-
-# ─────────────── label headers (unchanged) ────────────────
-LABELS = """ last first dob cin asm_date a_present a_source a_mode caregiver_assist a_goc a_omcg a_cgcomm a_lvstatus a_lvarr a_ed a_sect_comments
+# FULL label list
+LABELS = """
+last first dob cin asm_date a_present a_source a_mode caregiver_assist a_goc a_omcg a_cgcomm a_lvstatus a_lvarr a_ed a_sect_comments
 b_shortmem b_procmem b_sect_comments c_sect_comments d_pleasure d_anxious d_sad d_sect_comments
 e_social e_family e_other e_alone e_stress e_sect_comments
 f_mealperf f_mealcap f_hswperf f_hswcap f_fncperf f_fnccap f_medperf f_medcap f_phnperf f_phncap f_stairperf f_staircap
@@ -44,12 +37,14 @@ m_family m_commun m_sect_comments
 n_food n_shelter n_clothing n_meds n_hvac n_health n_sect_comments
 """.split()
 
+# add medication block
 for i in range(1, 27):
     LABELS.extend([
         f"ma_drug{i}", f"mad{i}", f"ma_unit{i}", f"ma_route{i}", f"ma_frq{i}",
         f"p{i}", f"ma_notes{i}", f"notes{i}"
     ])
 
+# remaining flags
 LABELS.extend("""
 chad_bp chad_copd chad_dm chad_heart chad_hip chad_odem chad_ofrac
 fsd_hemi fsd_ms fsd_para fsd_park fsd_pneu
@@ -57,103 +52,127 @@ od_d1 od_dd1 od_icd1 od_d2 od_dd2 od_icd2 od_d3 od_dd3 od_icd3 od_d4 od_dd4 od_i
 sec_age sec_loc sec_120 sec_adl1 sec_adl2 sec_adl3 sf_120 sf_sched sf_alone
 """.split())
 
+# File-reading helpers
+def read_pdf(path: Path) -> str:
+    with pdfplumber.open(path) as pdf:
+        return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-# helper: read PDF or DOCX 
+def read_docx(path: Path) -> str:
+    return "\n".join(p.text for p in Document(path).paragraphs)
+
 def load_text(path: Path) -> str:
-    if path.suffix.lower() == ".pdf":
-        with pdfplumber.open(path) as pdf:
-            # join all pages with newline between pages
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
-    elif path.suffix.lower() == ".docx":
-        return "\n".join(p.text for p in Document(path).paragraphs)
-    else:
-        raise ValueError("Unsupported file type (use .pdf or .docx)")
+    return read_pdf(path) if path.suffix.lower() == ".pdf" else read_docx(path)
 
+
+# Tiny utilities
+HEADER_RX = re.compile(
+    r"^([A-Z'’\-]+,\s+[A-Z'’\-]+)\s+Date of Birth:\s*([0-9/]{6,10})", re.I)
 
 def first_n_sentences(text: str, n=2) -> str:
-    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
-    return " ".join(sentences[:n])
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
+    return " ".join(parts[:n])
 
 def sectionize(text: str) -> dict:
-    sections, current = {}, "_preamble"
+    sections, cur = {}, "_preamble"
     for line in text.splitlines():
         m = re.match(r"^([\w ,/()]+):\s*$", line)
         if m and (line.isupper() or line.istitle()):
-            current = m.group(1).lower()
-            sections[current] = []
+            cur = m.group(1).lower()
+            sections[cur] = []
         else:
-            sections.setdefault(current, []).append(line)
+            sections.setdefault(cur, []).append(line)
     return {k: "\n".join(v).strip() for k, v in sections.items()}
 
-def postprocess(label, value):
-    if label in {"last", "first"} and "," in value:
-        last, first = [x.strip() for x in value.split(",", 1)]
-        return last if label == "last" else first
-    return value.strip("  ")
-
-# rules & wildcard helpers
-def load_rules() -> dict:
-    return yaml.safe_load(Path("label_map.yml").read_text())
+def load_yaml() -> dict:
+    yml = Path("label_map.yml")
+    return yaml.safe_load(yml.read_text()) if yml.exists() else {}
 
 def expand_wildcards(rules: dict, max_n=30) -> dict:
     out = {}
-    for label, rule in rules.items():
-        if "*" in label:
+    for lab, rule in rules.items():
+        if "*" in lab:
             for i in range(1, max_n + 1):
-                out[label.replace("*", str(i))] = {**rule, "row": i - 1}
+                out[lab.replace("*", str(i))] = {**rule, "row": i-1}
         else:
-            out[label] = rule
+            out[lab] = rule
     return out
 
 
-# extraction core
+# Core extraction
 def extract(path: Path) -> dict:
     text = load_text(path)
     sections = sectionize(text)
-    rules = expand_wildcards(load_rules())
 
+    # grab header LAST,FIRST  DOB
+    m = HEADER_RX.search(text.splitlines()[0])
+    header_last_first = m.group(1) if m else ""
+    header_dob = m.group(2) if m else ""
+
+    rules = expand_wildcards(load_yaml())
     row = {lab: "" for lab in LABELS}
 
-    for label, rule in rules.items():
+    if header_last_first:
+        last, first = [x.strip() for x in header_last_first.split(",", 1)]
+        row["last"], row["first"] = last, first
+    if header_dob:
+        row["dob"] = header_dob
+
+    for label in LABELS:
+        if row[label]:
+            continue  # already filled
+
+        rule = rules.get(label)
+        if not rule:
+            # automatic fallback
+            rule = {"search": [label.replace('_', ' ')], "type": "single_line"}
+
         variants = rule["search"]
-        candidate_secs = [
+        cand_secs = [
             s for name, s in sections.items()
             if any(re.search(v, name, re.I) for v in variants)
         ] or [text]
 
+        val = ""
         if rule["type"] == "single_line":
-            value = ""
-            for sec in candidate_secs:
+            for sec in cand_secs:
                 for v in variants:
-                    rx = rf"{re.escape(v)}[:\s]*([^\n]{{1,200}}?)(?:\s\s|\n|$)"
-                    m = re.search(rx, sec, flags=re.I)
-                    if m:
-                        value = m.group(1).strip()
+                    pat = rf"{re.escape(v)}[:\s]*([^\n]+)"
+                    if (mm := re.search(pat, sec, flags=re.I)):
+                        val = mm.group(1).strip()
                         break
-                if value:
+                if val:
                     break
-        elif rule["type"] == "paragraph":
-            value = first_n_sentences(candidate_secs[0],
-                                      rule.get("keep_n_sentences", 2))
-        else:
-            value = ""
 
-        row[label] = postprocess(label, value)
+        elif rule["type"] == "multi_line":
+            for sec in cand_secs:
+                for v in variants:
+                    pat = rf"{re.escape(v)}[:\s]*(.+?)(?=\n[A-Z0-9 ,/()]+:\s|\n\s*\n|$)"
+                    if (mm := re.search(pat, sec, flags=re.I | re.S)):
+                        val = " ".join(mm.group(1).splitlines()).strip()
+                        break
+                if val:
+                    break
+
+        elif rule["type"] == "paragraph":
+            val = first_n_sentences(cand_secs[0], rule.get("keep_n_sentences", 2))
+
+        row[label] = val
 
     return row
 
+
 def write_row(row, headers, out_path):
     df = pd.DataFrame([[row.get(h, "") for h in headers]], columns=headers)
-    (df.to_csv if out_path.lower().endswith(".csv") else df.to_excel)(out_path,
-                                                                     index=False)
+    (df.to_excel if out_path.endswith(".xlsx") else df.to_csv)(out_path, index=False)
+
+
 # CLI
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Extract NY‑UAS PDF/DOCX → spreadsheet")
-    parser.add_argument("file", help="Assessment file (.pdf or .docx)")
-    parser.add_argument("-o", "--out", default="output.xlsx",
-                        help="Output file (.xlsx or .csv)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="NY‑UAS PDF/DOCX extractor")
+    ap.add_argument("file", help=".pdf or .docx")
+    ap.add_argument("-o", "--out", default="output.xlsx")
+    args = ap.parse_args()
 
-    result = extract(Path(args.file))
-    write_row(result, LABELS, args.out)
+    data = extract(Path(args.file))
+    write_row(data, LABELS, args.out)
     print(f"Saved {args.out}")

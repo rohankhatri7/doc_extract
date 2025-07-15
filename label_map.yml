@@ -1,61 +1,23 @@
-# ─── Top header fields ────────────────────────────────────────────────────────
-last:
-  search: ["^\\s*[A-Z]+,\\s+[A-Z]+"]     # whole LAST, FIRST line
-  type: single_line
+# Only tricky or multi‑line fields go here.
+# Everything else is auto‑matched by its label name.
 
-first:
-  search: ["^\\s*[A-Z]+,\\s+[A-Z]+"]     # same line (we split later)
+last:
+  search: ["^[A-Z].+, [A-Z]+"]
   type: single_line
 
 dob:
   search: ["Date of Birth"]
   type: single_line
 
-cin:
-  search: ["Medicaid ID"]
-  type: single_line
-
-asm_date:
-  search: ["Assessment Date"]
-  type: single_line
-
-
-# ─── Section A : Intake/History ───────────────────────────────────────────────
 a_present:
   search: ["Others Present at Assessment"]
-  type: single_line
+  type: multi_line
 
 a_source:
-  search: ["Information used in assessment", "Source of information"]
-  type: single_line
-
-a_mode:
-  search: ["Mode of Assessment"]
-  type: single_line
-
-caregiver_assist:
-  search: ["Caregiver assistance during assessment"]
-  type: single_line
+  search: ["Information used in assessment"]
+  type: multi_line
 
 a_goc:
-  search: ["Person's expressed goals of care"]
+  search: ["goals of care"]
   type: paragraph
   keep_n_sentences: 2
-
-
-# ─── Wild‑card example for medications (ma_drug1 … ma_notes26) ───────────────
-ma_drug*:
-  search: ["Medication Name", "Drug"]
-  type: single_line
-
-ma_unit*:
-  search: ["Dosage", "Dose", "Unit"]
-  type: single_line
-
-ma_route*:
-  search: ["Route"]
-  type: single_line
-
-ma_frq*:
-  search: ["Frequency", "Freq"]
-  type: single_line
