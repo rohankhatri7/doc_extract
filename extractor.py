@@ -1,9 +1,19 @@
+#!/usr/bin/env python3
+"""
+NY‑UAS single‑document extractor  – PDF or DOCX  (no NLTK)
+───────────────────────────────────────────────────────────
+• Reads Chrome‑saved PDF or DOCX
+• Uses a *tiny* YAML override file (label_map.yml)
+    - rule types: single_line  •  multi_line  •  paragraph  •  regex
+• Any label not in YAML falls back to:
+      label → "label with spaces:" → single‑line capture
+"""
+
 import re, argparse, yaml, pandas as pd
 from pathlib import Path
 import pdfplumber
 from docx import Document
 
-# FULL label list
 LABELS = """
 last first dob cin asm_date a_present a_source a_mode caregiver_assist a_goc a_omcg a_cgcomm a_lvstatus a_lvarr a_ed a_sect_comments
 b_shortmem b_procmem b_sect_comments c_sect_comments d_pleasure d_anxious d_sad d_sect_comments
@@ -26,6 +36,7 @@ m_family m_commun m_sect_comments
 n_food n_shelter n_clothing n_meds n_hvac n_health n_sect_comments
 """.split()
 
+# add medication block
 for i in range(1, 27):
     LABELS.extend([
         f"ma_drug{i}", f"mad{i}", f"ma_unit{i}", f"ma_route{i}", f"ma_frq{i}",
@@ -39,6 +50,7 @@ od_d1 od_dd1 od_icd1 od_d2 od_dd2 od_icd2 od_d3 od_dd3 od_icd3 od_d4 od_dd4 od_i
 sec_age sec_loc sec_120 sec_adl1 sec_adl2 sec_adl3 sf_120 sf_sched sf_alone
 """.split())
 
+
 def read_pdf(path: Path) -> str:
     with pdfplumber.open(path) as pdf:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
@@ -48,15 +60,6 @@ def read_docx(path: Path) -> str:
 
 def load_text(path: Path) -> str:
     return read_pdf(path) if path.suffix.lower() == ".pdf" else read_docx(path)
-
-
-HEADER_RX = re.compile(
-    r"""
-    ^\s*
-    ([A-Z'’\-]+),\s+([A-Z'’\-]+)             # last, first
-    \s+Date\ of\ Birth:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})  # dob
-    \s+(?:Medicaid\s+ID|Medical\s+ID):\s*([A-Z0-9]+)          # cin
-    """, re.I | re.X)
 
 def first_n_sentences(text: str, n=2) -> str:
     parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
@@ -88,31 +91,20 @@ def expand_wildcards(rules: dict, max_n=30) -> dict:
     return out
 
 
-# Core extraction
 def extract(path: Path) -> dict:
     text = load_text(path)
     sections = sectionize(text)
-
-    # header grab
-    m = HEADER_RX.search(text.splitlines()[0])
-    header_vals = m.groups() if m else ("", "", "", "")
-    header_last, header_first, header_dob, header_cin = header_vals
-
     rules = expand_wildcards(load_yaml())
+
     row = {lab: "" for lab in LABELS}
 
-    if header_last:
-        row["last"], row["first"] = header_last, header_first
-        row["dob"], row["cin"] = header_dob, header_cin
-
-    # extract
     for label in LABELS:
         if row[label]:
             continue
 
         rule = rules.get(label)
         if not rule:
-            # fallback rule
+            # auto‑fallback rule
             rule = {"search": [label.replace('_', ' ')], "type": "single_line"}
 
         variants = rule["search"]
@@ -122,13 +114,13 @@ def extract(path: Path) -> dict:
         ] or [text]
 
         val = ""
+        # rule handlers
         if rule["type"] == "single_line":
             for sec in cand_secs:
                 for v in variants:
-                    # stop at 2+ spaces, newline, or end
                     pat = rf"{re.escape(v)}[:\s]*(.+?)(?=\s{{2,}}|\n|$)"
-                    if (mm := re.search(pat, sec, flags=re.I)):
-                        val = mm.group(1).strip()
+                    if (m := re.search(pat, sec, flags=re.I)):
+                        val = m.group(1).strip()
                         break
                 if val:
                     break
@@ -137,8 +129,8 @@ def extract(path: Path) -> dict:
             for sec in cand_secs:
                 for v in variants:
                     pat = rf"{re.escape(v)}[:\s]*(.+?)(?=\n[A-Z0-9 ,/()]+:\s|\n\s*\n|$)"
-                    if (mm := re.search(pat, sec, flags=re.I | re.S)):
-                        val = " ".join(mm.group(1).splitlines()).strip()
+                    if (m := re.search(pat, sec, flags=re.I | re.S)):
+                        val = " ".join(m.group(1).splitlines()).strip()
                         break
                 if val:
                     break
@@ -147,23 +139,35 @@ def extract(path: Path) -> dict:
             val = first_n_sentences(cand_secs[0],
                                     rule.get("keep_n_sentences", 2))
 
-        row[label] = val
+        elif rule["type"] == "regex":
+            # run pattern on full text first
+            pat = rule["pattern"]
+            m = re.search(pat, text, flags=re.I | re.S)
+            if not m:
+                # optional: try candidate sections (rarely needed)
+                for sec in cand_secs:
+                    m = re.search(pat, sec, flags=re.I | re.S)
+                    if m:
+                        break
+            val = m.group(1).strip() if m else ""
 
+
+        row[label] = val
     return row
 
 
 def write_row(row, headers, out_path):
     df = pd.DataFrame([[row.get(h, "") for h in headers]], columns=headers)
-    (df.to_excel if out_path.endswith(".xlsx") else df.to_csv)(out_path, index=False)
+    (df.to_excel if out_path.endswith(".xlsx") else df.to_csv)(out_path,
+                                                               index=False)
 
 
 # CLI
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="NY‑UAS PDF/DOCX extractor")
-    ap.add_argument("file", help=".pdf or .docx file")
+    ap.add_argument("file", help=".pdf or .docx")
     ap.add_argument("-o", "--out", default="output.xlsx")
     args = ap.parse_args()
 
-    data = extract(Path(args.file))
-    write_row(data, LABELS, args.out)
+    write_row(extract(Path(args.file)), LABELS, args.out)
     print(f"Saved {args.out}")
