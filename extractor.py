@@ -104,10 +104,13 @@ def extract(path: Path) -> dict:
 
         rule = rules.get(label)
         if not rule:
-            # auto‑fallback rule
             rule = {"search": [label.replace('_', ' ')], "type": "single_line"}
 
-        variants = rule["search"]
+        rule_type = rule["type"]
+
+        # regex rules don't need 'search'
+        variants = rule.get("search", []) if rule_type != "regex" else []
+
         cand_secs = [
             s for name, s in sections.items()
             if any(re.search(v, name, re.I) for v in variants)
@@ -118,7 +121,7 @@ def extract(path: Path) -> dict:
         if rule["type"] == "single_line":
             for sec in cand_secs:
                 for v in variants:
-                    pat = rf"{re.escape(v)}[:\s]*(.+?)(?=\s{{2,}}|\n|$)"
+                    pat = rf"{re.escape(v)}[\s:]*(.+?)(?=\s{{2,}}|\n|$)"
                     if (m := re.search(pat, sec, flags=re.I)):
                         val = m.group(1).strip()
                         break
@@ -128,7 +131,7 @@ def extract(path: Path) -> dict:
         elif rule["type"] == "multi_line":
             for sec in cand_secs:
                 for v in variants:
-                    pat = rf"{re.escape(v)}[:\s]*(.+?)(?=\n[A-Z0-9 ,/()]+:\s|\n\s*\n|$)"
+                    pat = rf"{re.escape(v)}[\s:]*(.+?)(?=\n[A-Z0-9 ,/()]+:\s|\n\s*\n|$)"
                     if (m := re.search(pat, sec, flags=re.I | re.S)):
                         val = " ".join(m.group(1).splitlines()).strip()
                         break
@@ -137,7 +140,7 @@ def extract(path: Path) -> dict:
 
         elif rule["type"] == "paragraph":
             val = first_n_sentences(cand_secs[0],
-                                    rule.get("keep_n_sentences", 2))
+                                  rule.get("keep_n_sentences", 2))
 
         elif rule["type"] == "regex":
             # run pattern on full text first
@@ -150,7 +153,6 @@ def extract(path: Path) -> dict:
                     if m:
                         break
             val = m.group(1).strip() if m else ""
-
 
         row[label] = val
     return row
