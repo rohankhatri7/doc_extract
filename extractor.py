@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-NY‑UAS single‑document extractor  – PDF *or* DOCX (no NLTK)
-===========================================================
-
-• Accepts Chrome‑saved PDFs or the original .docx
-• Uses a *tiny YAML override file* for tricky fields
-• Every other label falls back to:  label → "label with spaces:" → single‑line grab
-• Supports 'single_line', 'multi_line', and 'paragraph' rule types
-"""
-
 import re, argparse, yaml, pandas as pd
 from pathlib import Path
 import pdfplumber
@@ -37,14 +26,12 @@ m_family m_commun m_sect_comments
 n_food n_shelter n_clothing n_meds n_hvac n_health n_sect_comments
 """.split()
 
-# add medication block
 for i in range(1, 27):
     LABELS.extend([
         f"ma_drug{i}", f"mad{i}", f"ma_unit{i}", f"ma_route{i}", f"ma_frq{i}",
         f"p{i}", f"ma_notes{i}", f"notes{i}"
     ])
 
-# remaining flags
 LABELS.extend("""
 chad_bp chad_copd chad_dm chad_heart chad_hip chad_odem chad_ofrac
 fsd_hemi fsd_ms fsd_para fsd_park fsd_pneu
@@ -52,7 +39,6 @@ od_d1 od_dd1 od_icd1 od_d2 od_dd2 od_icd2 od_d3 od_dd3 od_icd3 od_d4 od_dd4 od_i
 sec_age sec_loc sec_120 sec_adl1 sec_adl2 sec_adl3 sf_120 sf_sched sf_alone
 """.split())
 
-# File-reading helpers
 def read_pdf(path: Path) -> str:
     with pdfplumber.open(path) as pdf:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
@@ -64,9 +50,13 @@ def load_text(path: Path) -> str:
     return read_pdf(path) if path.suffix.lower() == ".pdf" else read_docx(path)
 
 
-# Tiny utilities
 HEADER_RX = re.compile(
-    r"^([A-Z'’\-]+,\s+[A-Z'’\-]+)\s+Date of Birth:\s*([0-9/]{6,10})", re.I)
+    r"""
+    ^\s*
+    ([A-Z'’\-]+),\s+([A-Z'’\-]+)             # last, first
+    \s+Date\ of\ Birth:\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})  # dob
+    \s+(?:Medicaid\s+ID|Medical\s+ID):\s*([A-Z0-9]+)          # cin
+    """, re.I | re.X)
 
 def first_n_sentences(text: str, n=2) -> str:
     parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
@@ -103,27 +93,26 @@ def extract(path: Path) -> dict:
     text = load_text(path)
     sections = sectionize(text)
 
-    # grab header LAST,FIRST  DOB
+    # header grab
     m = HEADER_RX.search(text.splitlines()[0])
-    header_last_first = m.group(1) if m else ""
-    header_dob = m.group(2) if m else ""
+    header_vals = m.groups() if m else ("", "", "", "")
+    header_last, header_first, header_dob, header_cin = header_vals
 
     rules = expand_wildcards(load_yaml())
     row = {lab: "" for lab in LABELS}
 
-    if header_last_first:
-        last, first = [x.strip() for x in header_last_first.split(",", 1)]
-        row["last"], row["first"] = last, first
-    if header_dob:
-        row["dob"] = header_dob
+    if header_last:
+        row["last"], row["first"] = header_last, header_first
+        row["dob"], row["cin"] = header_dob, header_cin
 
+    # extract
     for label in LABELS:
         if row[label]:
-            continue  # already filled
+            continue
 
         rule = rules.get(label)
         if not rule:
-            # automatic fallback
+            # fallback rule
             rule = {"search": [label.replace('_', ' ')], "type": "single_line"}
 
         variants = rule["search"]
@@ -136,7 +125,8 @@ def extract(path: Path) -> dict:
         if rule["type"] == "single_line":
             for sec in cand_secs:
                 for v in variants:
-                    pat = rf"{re.escape(v)}[:\s]*([^\n]+)"
+                    # stop at 2+ spaces, newline, or end
+                    pat = rf"{re.escape(v)}[:\s]*(.+?)(?=\s{{2,}}|\n|$)"
                     if (mm := re.search(pat, sec, flags=re.I)):
                         val = mm.group(1).strip()
                         break
@@ -154,7 +144,8 @@ def extract(path: Path) -> dict:
                     break
 
         elif rule["type"] == "paragraph":
-            val = first_n_sentences(cand_secs[0], rule.get("keep_n_sentences", 2))
+            val = first_n_sentences(cand_secs[0],
+                                    rule.get("keep_n_sentences", 2))
 
         row[label] = val
 
@@ -169,7 +160,7 @@ def write_row(row, headers, out_path):
 # CLI
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="NY‑UAS PDF/DOCX extractor")
-    ap.add_argument("file", help=".pdf or .docx")
+    ap.add_argument("file", help=".pdf or .docx file")
     ap.add_argument("-o", "--out", default="output.xlsx")
     args = ap.parse_args()
 
