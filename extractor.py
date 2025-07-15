@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-NY‑UAS single‑document extractor  – PDF or DOCX  (no NLTK)
-───────────────────────────────────────────────────────────
-• Reads Chrome‑saved PDF or DOCX
-• Uses a *tiny* YAML override file (label_map.yml)
-    - rule types: single_line  •  multi_line  •  paragraph  •  regex
-• Any label not in YAML falls back to:
-      label → "label with spaces:" → single‑line capture
-"""
-
 import re, argparse, yaml, pandas as pd
 from pathlib import Path
 import pdfplumber
@@ -36,7 +26,6 @@ m_family m_commun m_sect_comments
 n_food n_shelter n_clothing n_meds n_hvac n_health n_sect_comments
 """.split()
 
-# add medication block
 for i in range(1, 27):
     LABELS.extend([
         f"ma_drug{i}", f"mad{i}", f"ma_unit{i}", f"ma_route{i}", f"ma_frq{i}",
@@ -49,7 +38,6 @@ fsd_hemi fsd_ms fsd_para fsd_park fsd_pneu
 od_d1 od_dd1 od_icd1 od_d2 od_dd2 od_icd2 od_d3 od_dd3 od_icd3 od_d4 od_dd4 od_icd4
 sec_age sec_loc sec_120 sec_adl1 sec_adl2 sec_adl3 sf_120 sf_sched sf_alone
 """.split())
-
 
 def read_pdf(path: Path) -> str:
     with pdfplumber.open(path) as pdf:
@@ -90,86 +78,61 @@ def expand_wildcards(rules: dict, max_n=30) -> dict:
             out[lab] = rule
     return out
 
-
 def extract(path: Path) -> dict:
     text = load_text(path)
     sections = sectionize(text)
     rules = expand_wildcards(load_yaml())
-
     row = {lab: "" for lab in LABELS}
-
     for label in LABELS:
         if row[label]:
             continue
-
-        rule = rules.get(label)
-        if not rule:
-            rule = {"search": [label.replace('_', ' ')], "type": "single_line"}
-
+        rule = rules.get(label) or {"search": [label.replace('_', ' ')], "type": "single_line"}
         rule_type = rule["type"]
-
-        # regex rules don't need 'search'
         variants = rule.get("search", []) if rule_type != "regex" else []
-
-        cand_secs = [
-            s for name, s in sections.items()
-            if any(re.search(v, name, re.I) for v in variants)
-        ] or [text]
-
+        cand_secs = [s for n, s in sections.items() if any(re.search(v, n, re.I) for v in variants)] or [text]
         val = ""
-        # rule handlers
-        if rule["type"] == "single_line":
+        if rule_type == "single_line":
             for sec in cand_secs:
                 for v in variants:
                     pat = rf"{re.escape(v)}[\s:]*(.+?)(?=\s{{2,}}|\n|$)"
-                    if (m := re.search(pat, sec, flags=re.I)):
+                    m = re.search(pat, sec, flags=re.I)
+                    if m:
                         val = m.group(1).strip()
                         break
                 if val:
                     break
-
-        elif rule["type"] == "multi_line":
+        elif rule_type == "multi_line":
             for sec in cand_secs:
                 for v in variants:
                     pat = rf"{re.escape(v)}[\s:]*(.+?)(?=\n[A-Z0-9 ,/()]+:\s|\n\s*\n|$)"
-                    if (m := re.search(pat, sec, flags=re.I | re.S)):
+                    m = re.search(pat, sec, flags=re.I | re.S)
+                    if m:
                         val = " ".join(m.group(1).splitlines()).strip()
                         break
                 if val:
                     break
-
-        elif rule["type"] == "paragraph":
-            val = first_n_sentences(cand_secs[0],
-                                  rule.get("keep_n_sentences", 2))
-
-        elif rule["type"] == "regex":
-            # run pattern on full text first
+        elif rule_type == "paragraph":
+            val = first_n_sentences(cand_secs[0], rule.get("keep_n_sentences", 2))
+        elif rule_type == "regex":
             pat = rule["pattern"]
-            m = re.search(pat, text, flags=re.I | re.S)
+            m = re.search(pat, text, flags=re.I | re.S | re.M)
             if not m:
-                # optional: try candidate sections (rarely needed)
                 for sec in cand_secs:
-                    m = re.search(pat, sec, flags=re.I | re.S)
+                    m = re.search(pat, sec, flags=re.I | re.S | re.M)
                     if m:
                         break
             val = m.group(1).strip() if m else ""
-
         row[label] = val
     return row
 
-
 def write_row(row, headers, out_path):
     df = pd.DataFrame([[row.get(h, "") for h in headers]], columns=headers)
-    (df.to_excel if out_path.endswith(".xlsx") else df.to_csv)(out_path,
-                                                               index=False)
+    (df.to_excel if out_path.endswith(".xlsx") else df.to_csv)(out_path, index=False)
 
-
-# CLI
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="NY‑UAS PDF/DOCX extractor")
-    ap.add_argument("file", help=".pdf or .docx")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("file")
     ap.add_argument("-o", "--out", default="output.xlsx")
     args = ap.parse_args()
-
     write_row(extract(Path(args.file)), LABELS, args.out)
     print(f"Saved {args.out}")

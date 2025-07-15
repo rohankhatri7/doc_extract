@@ -15,6 +15,10 @@ cin:
   type: regex
   pattern: "(?:Medicaid|Medical)\\s+ID:\\s*([A-Z0-9]+)"
 
+asm_date:
+  type: single_line
+  search: ["Assessment Date"]
+
 # Example multi‑line / paragraph overrides
 a_present:
   type: multi_line
