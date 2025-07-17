@@ -11,7 +11,7 @@ import format_documents
 from dotenv import load_dotenv
 from ratelimit import limits, RateLimitException
 import pdfplumber
-import tempfile
+import io
 
 load_dotenv()
 endpoint = os.getenv("AZURE_DOC_INTELLIGENCE_ENDPOINT")
@@ -45,7 +45,6 @@ def model_call_bytes(document_bytes, model_id):
     )
     result = poller.result()
     return result
-
 
 def default_model_result(directory_path, excel_path):
     results = []
@@ -168,26 +167,26 @@ def upsert_to_excel(df_new, sheet_name, excel_path):
             df_new.to_excel(writer, sheet_name=sheet_name, index=False)
 
 def single_doc_testing(doc_path, model_id):
-    sample_row = pd.read_csv("sample_data.csv").iloc[0]
-    sample_values = {str(v).strip() for v in sample_row if pd.notna(v)}
+    label_list_str = """<LABEL_LIST_PLACEHOLDER>"""
+    label_set = {lbl.strip() for lbl in label_list_str.split(",") if lbl.strip()}
     match_count = 0
-    total_needed = len(sample_values)
+    total_needed = len(label_set)
     with pdfplumber.open(doc_path) as pdf:
         for page in pdf.pages:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                page.to_image(resolution=300).save(tmp.name, format="PNG")
-                with open(tmp.name, "rb") as f:
-                    result = model_call_bytes(f, model_id=model_id)
-                os.remove(tmp.name)
+            img_bytes = io.BytesIO()
+            page.to_image(resolution=300).save(img_bytes, format="PNG")
+            img_bytes.seek(0)
+            result = model_call_bytes(img_bytes.read(), model_id=model_id)
             for kv_pair in result.key_value_pairs:
                 if kv_pair.confidence < KV_CONFIDENCE_MIN:
                     continue
                 key_content = kv_pair.key.content if kv_pair.key else ""
                 value_content = kv_pair.value.content if kv_pair.value else ""
-                if value_content.strip() in sample_values:
+                stripped_val = value_content.strip().strip("{}").strip()
+                if stripped_val in label_set:
                     match_count += 1
                 print(f"Key: '{key_content}' -> Value: '{value_content}' Conf: {kv_pair.confidence:.2f}")
-    print(f"\nMatched {match_count}/{total_needed} sample values")
+    print(f"\nMatched {match_count}/{total_needed} label placeholders")
 
 if __name__ == "__main__":
     single_doc_testing("template-nogridlines-5.21.1.pdf", "prebuilt-document")
