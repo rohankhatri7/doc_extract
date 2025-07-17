@@ -11,7 +11,6 @@ import format_documents
 from dotenv import load_dotenv
 from ratelimit import limits, RateLimitException
 import pdfplumber
-import io
 import tempfile
 
 load_dotenv()
@@ -20,6 +19,7 @@ key = os.getenv("AZURE_DOC_INTELLIGENCE_KEY")
 
 CALLS = 1
 RATE_LIMIT_PERIOD = 60
+KV_CONFIDENCE_MIN = 0.30
 
 def model_call(document_path, model_id):
     document_analysis_client = DocumentAnalysisClient(
@@ -46,72 +46,6 @@ def model_call_bytes(document_bytes, model_id):
     result = poller.result()
     return result
 
-def id_model_result(directory_path, excel_path):
-    results = []
-    search_pattern = os.path.join(directory_path, '*')
-    jpg_files = glob.glob(search_pattern)
-    for jpg_file in jpg_files:
-        try:
-            result = model_call(jpg_file, model_id="prebuilt-idDocument")
-        except RateLimitException as e:
-            time.sleep(e.period_remaining)
-            print(f"Rate limit reached. Sleeping for {e.period_remaining} seconds...")
-        print(f"Processed {jpg_file} with ID model.")
-        output = format_documents.format_id_document(result.documents[0], "idDocument")
-        first_name = output.get("first_name", "")
-        last_name = output.get("last_name", "")
-        ssn = output.get("ssn", "")
-        dob = output.get("dob", "")
-        address_parts = [
-            output.get("street1", ""),
-            output.get("city", ""),
-            output.get("state", ""),
-            output.get("zip_code", "")
-        ]
-        address = ", ".join([part for part in address_parts if part])
-        results.append({
-            "file_name": os.path.basename(jpg_file),
-            "first_name": first_name,
-            "last_name": last_name,
-            "ssn": ssn,
-            "dob": dob,
-            "address": address,
-        })
-    if results:
-        df = pd.DataFrame(results)
-        upsert_to_excel(df, "id_model", excel_path)
-
-def tax_return_model_result(directory_path, excel_path):
-    results = []
-    search_pattern = os.path.join(directory_path, '*')
-    jpg_files = glob.glob(search_pattern)
-    for jpg_file in jpg_files:
-        with open(jpg_file, "rb") as f:
-            result = model_call(jpg_file, model_id="prebuilt-tax.us.w2")
-        print(f"Processed {jpg_file} with tax return model.")
-        if result:
-            out = format_documents.format_tax_document(result.documents[0], "prebuilt-tax.us.w2")
-            first_name = out.get("first_name", "")
-            last_name = out.get("last_name", "")
-            ssn = out.get("ssn", "")
-            address_parts = [
-                out.get("street1", ""),
-                out.get("city", ""),
-                out.get("state", ""),
-                out.get("zip_code", "")
-            ]
-            address = ", ".join([part for part in address_parts if part])
-            results.append({
-                "file_name": os.path.basename(jpg_file),
-                "first_name": first_name,
-                "last_name": last_name,
-                "address": address,
-                "ssn": ssn,
-                "dob": ""
-            })
-    if results:
-        df = pd.DataFrame(results)
-        upsert_to_excel(df, "Tax_Returns", excel_path)
 
 def default_model_result(directory_path, excel_path):
     results = []
@@ -160,6 +94,8 @@ def default_model_result(directory_path, excel_path):
             full_name = ""
             ssn = ""
             for kv_pair in result.key_value_pairs:
+                if kv_pair.confidence < KV_CONFIDENCE_MIN:
+                    continue
                 key_content = kv_pair.key.content if kv_pair.key else ""
                 value_content = kv_pair.value.content if kv_pair.value else ""
                 if paystub_name_pattern.match(key_content.strip()) and not full_name:
@@ -189,6 +125,8 @@ def default_model_result(directory_path, excel_path):
         else:
             first_name = last_name = address = ssn = ""
             for kv_pair in result.key_value_pairs:
+                if kv_pair.confidence < KV_CONFIDENCE_MIN:
+                    continue
                 key_content = kv_pair.key.content if kv_pair.key else ""
                 value_content = kv_pair.value.content if kv_pair.value else ""
                 if first_name_pattern.search(key_content) and not first_name:
@@ -230,7 +168,10 @@ def upsert_to_excel(df_new, sheet_name, excel_path):
             df_new.to_excel(writer, sheet_name=sheet_name, index=False)
 
 def single_doc_testing(doc_path, model_id):
-    placeholder_set = set()
+    sample_row = pd.read_csv("sample_data.csv").iloc[0]
+    sample_values = {str(v).strip() for v in sample_row if pd.notna(v)}
+    match_count = 0
+    total_needed = len(sample_values)
     with pdfplumber.open(doc_path) as pdf:
         for page in pdf.pages:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -239,21 +180,14 @@ def single_doc_testing(doc_path, model_id):
                     result = model_call_bytes(f, model_id=model_id)
                 os.remove(tmp.name)
             for kv_pair in result.key_value_pairs:
-                if kv_pair.key and kv_pair.value:
-                    print(f"Key: '{kv_pair.key.content}' -> Value: '{kv_pair.value.content}'")
-                elif kv_pair.key:
-                    print(f"Key: '{kv_pair.key.content}' -> Value: ''")
-            for kv_pair in result.key_value_pairs:
-                if kv_pair.value:
-                    val = kv_pair.value.content.strip()
-                    m = re.fullmatch(r"\{\{\s*([^}]+?)\s*\}\}", val)
-                    if m:
-                        placeholder_set.add(m.group(1))
-    label_list_str = """<LABEL_LIST_PLACEHOLDER>"""
-    label_set = {lbl.strip() for lbl in label_list_str.split(",")}
-    total_labels = len(label_set)
-    matches = placeholder_set & label_set
-    print(f"\nMatched {len(matches)}/{total_labels} placeholders")
+                if kv_pair.confidence < KV_CONFIDENCE_MIN:
+                    continue
+                key_content = kv_pair.key.content if kv_pair.key else ""
+                value_content = kv_pair.value.content if kv_pair.value else ""
+                if value_content.strip() in sample_values:
+                    match_count += 1
+                print(f"Key: '{key_content}' -> Value: '{value_content}' Conf: {kv_pair.confidence:.2f}")
+    print(f"\nMatched {match_count}/{total_needed} sample values")
 
 if __name__ == "__main__":
     single_doc_testing("template-nogridlines-5.21.1.pdf", "prebuilt-document")
